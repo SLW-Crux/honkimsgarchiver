@@ -1,0 +1,37 @@
+#!/bin/sh
+# ============================================================================
+# commit-msg — git hook entry point for AI usage tracking (CROSS-PLATFORM)
+# ============================================================================
+#
+# Runs the AI-usage tracking script with whichever interpreter is available,
+# in this order:
+#   1. python3        -> append-ai-usage.py   (macOS ships it with the Xcode
+#                        Command Line Tools; Linux has it everywhere)
+#   2. pwsh           -> append-ai-usage.ps1  (PowerShell 7+)
+#   3. powershell.exe -> append-ai-usage.ps1  (Windows PowerShell 5.1, only
+#                        when WINDIR is set, i.e. Git Bash on Windows)
+#
+# AI-usage tracking is mandatory in this organisation: if NO interpreter is
+# found the commit is blocked (exit 1) with install instructions. The tracking
+# scripts themselves never fail a commit on their own errors.
+#
+# Activation (per clone):  git config core.hooksPath .githooks
+# ============================================================================
+
+COMMIT_MSG_FILE="$1"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+if command -v python3 >/dev/null 2>&1; then
+  python3 "$SCRIPT_DIR/append-ai-usage.py" "$COMMIT_MSG_FILE"
+  exit $?
+elif command -v pwsh >/dev/null 2>&1; then
+  pwsh -NoProfile -File "$SCRIPT_DIR/append-ai-usage.ps1" -CommitMsgFile "$COMMIT_MSG_FILE"
+  exit $?
+elif { [ -n "$WINDIR" ] || [ -n "$windir" ]; } && command -v powershell.exe >/dev/null 2>&1; then
+  powershell.exe -NoProfile -ExecutionPolicy Bypass \
+    -File "$SCRIPT_DIR/append-ai-usage.ps1" -CommitMsgFile "$COMMIT_MSG_FILE"
+  exit $?
+else
+  echo "ai-usage hook: no interpreter found (python3 or pwsh). AI-usage tracking is mandatory in this organisation — install Xcode Command Line Tools (xcode-select --install) or 'brew install powershell'. Commit blocked." >&2
+  exit 1
+fi

@@ -1,0 +1,19 @@
+#!/bin/sh
+# ============================================================================
+# pre-commit — chain to the pre-commit framework (secret gate) from .githooks
+# ============================================================================
+#
+# Activating AI tracking (`git config core.hooksPath .githooks`) points git at
+# THIS folder for ALL hooks — which silently disables anything the pre-commit
+# framework installed into .git/hooks (the gitleaks secret gate). This shim
+# restores the chain: if the framework is on PATH, run it against the staged
+# changes exactly as its own hook would; otherwise warn and allow the commit
+# (the hook chain is best-effort — CI remains the real enforcement).
+# ============================================================================
+
+if command -v pre-commit >/dev/null 2>&1; then
+  exec pre-commit run --hook-stage pre-commit
+else
+  echo "pre-commit framework not found — secret gate skipped. Install with: pip install pre-commit (or brew install pre-commit)"
+  exit 0
+fi
