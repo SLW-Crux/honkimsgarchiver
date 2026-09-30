@@ -52,7 +52,7 @@
 #     └─ .githooks/commit-msg (sh shim)           └─ reads commit messages via API
 #          └─ THIS SCRIPT                             └─ parses the trailers below
 #               ├─ reads Claude Code JSONL logs          └─ aggregates per developer
-#               │   (~/.claude/projects/<repo>)              + per repo into one issue
+#               │   (<config dir>/projects/<repo>)           + per repo into one issue
 #               └─ reads git's staged diff
 #                    └─ writes AI-* / Lines-* / Tests-* trailers onto the commit
 #
@@ -89,15 +89,14 @@ $ErrorActionPreference = "SilentlyContinue"
 # so this is true on Mac/Linux and false on Windows, on every PowerShell edition.
 $IsUnixHost = ($PSVersionTable.Platform -eq 'Unix')
 
-# Claude Code stores session logs under the user profile. The folder name and
-# path separator differ by OS:
+# Claude Code stores session logs under its config dir: $CLAUDE_CONFIG_DIR when
+# set (e.g. an alias that points Claude Code at ~/.claude-devs), otherwise
+# ~/.claude. Every candidate below is checked — including any other ~/.claude-*
+# — so a commit from a plain terminal still finds logs written under a custom
+# config dir. The user profile differs by OS:
 #   Windows : %USERPROFILE%\.claude\projects
 #   macOS   : $HOME/.claude/projects
-$ClaudeLogRoot = if ($IsUnixHost) {
-    Join-Path $env:HOME ".claude/projects"
-} else {
-    Join-Path $env:USERPROFILE ".claude\projects"
-}
+$UserHome = if ($IsUnixHost) { $env:HOME } else { $env:USERPROFILE }
 
 # All five reliable auto-detected categories
 # Key = trailer suffix   Value = detection rules (evaluated in order)
@@ -142,33 +141,85 @@ function Get-LastCommitTime {
     return [DateTime]::MinValue
 }
 
+# Every place Claude Code may keep its projects folder, in lookup order.
+# Existence is not checked here (the warning names all of them).
+function Get-ClaudeLogCandidates {
+    $list = [System.Collections.Generic.List[string]]::new()
+    if ($env:CLAUDE_CONFIG_DIR) { $list.Add((Join-Path $env:CLAUDE_CONFIG_DIR "projects")) }
+    if ($UserHome) {
+        $list.Add((Join-Path (Join-Path $UserHome ".claude") "projects"))
+        Get-ChildItem -Path $UserHome -Directory -Filter ".claude-*" -Force -ErrorAction SilentlyContinue |
+            Sort-Object Name | ForEach-Object { $list.Add((Join-Path $_.FullName "projects")) }
+    }
+    return ,$list
+}
+
+# Absolute path with every symlink/junction component resolved (realpath), so
+# the same directory reached two ways is recognised as one. Best-effort: on any
+# error the path is returned as given.
+function Resolve-RealPath {
+    param([string]$Path, [int]$Depth = 0)
+    if ($Depth -gt 40) { return $Path }
+    try {
+        $full   = [System.IO.Path]::GetFullPath($Path)
+        $parent = Split-Path $full -Parent
+        if ($parent -and $parent -ne $full) {
+            $full = Join-Path (Resolve-RealPath -Path $parent -Depth ($Depth + 1)) (Split-Path $full -Leaf)
+        }
+        $item = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+        if ($item.LinkType -eq 'SymbolicLink' -or $item.LinkType -eq 'Junction') {
+            $target = @($item.Target)[0]
+            if (-not [System.IO.Path]::IsPathRooted($target)) { $target = Join-Path (Split-Path $full -Parent) $target }
+            return Resolve-RealPath -Path $target -Depth ($Depth + 1)
+        }
+        return $full
+    } catch { return $Path }
+}
+
+# The candidates that exist, de-duplicated by resolved path so a symlinked
+# config dir is not scanned (and counted) twice.
+function Get-ClaudeLogRoots {
+    $seen  = @{}
+    $roots = [System.Collections.Generic.List[string]]::new()
+    foreach ($root in (Get-ClaudeLogCandidates)) {
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+        $key = Resolve-RealPath $root
+        if (-not $seen.ContainsKey($key)) { $seen[$key] = $true; $roots.Add($root) }
+    }
+    return ,$roots
+}
+
 function Get-ProjectLogFolder {
-    $repoRoot = git rev-parse --show-toplevel 2>$null
+    param([string]$RepoRoot, [string]$Root)
     if (-not $repoRoot) { return $null }
 
-    # Claude encodes the project's absolute path into the log folder name by
-    # replacing path-structure characters with hyphens. The exact rule differs
-    # by OS, matching how Claude Code itself names the folder:
+    # Claude Code names the log folder after the project's absolute path with
+    # EVERY character that is not a letter or digit replaced by "-":
     #   Windows: C:\Users\me\repo        -> C--Users-me-repo
-    #            (\ -> /, then / and : -> -)
-    #   macOS  : /Users/me/My Project    -> -Users-me-My-Project
-    #            (leading / kept as leading -, and / . : and SPACE all -> -)
+    #   macOS  : /Users/me/My_Project   -> -Users-me-My-Project
+    # (An underscore becomes "-" too, so ~/Xx_Github/repo is -...-Xx-Github-repo.)
+    # The narrower rule this hook used before is kept as a second exact
+    # candidate so a log folder that genuinely has that shape is still found.
+    $encoded = $repoRoot -replace '[^A-Za-z0-9]', '-'
     if ($IsUnixHost) {
-        $encoded = $repoRoot -replace '[/ .:]', '-'
+        $legacy = $repoRoot -replace '[/ .:]', '-'
     } else {
-        $encoded = $repoRoot -replace '\\', '/' -replace '^/', '' -replace '[/:]', '-'
+        $legacy = $repoRoot -replace '\\', '/' -replace '^/', '' -replace '[/:]', '-'
+    }
+    foreach ($name in @($encoded, $legacy)) {
+        $candidate = Join-Path $Root $name
+        if (Test-Path -LiteralPath $candidate -PathType Container) { return $candidate }
     }
 
-    $candidate = Join-Path $ClaudeLogRoot $encoded
-    if (Test-Path $candidate) { return $candidate }
-
-    # Fallback: fuzzy match on repo leaf name
-    # FIX-W4: match on the ENCODED leaf ("my.repo" appears as "my-repo" in the folder name)
-    $repoLeaf = Split-Path $repoRoot -Leaf
-    if ($IsUnixHost) { $repoLeaf = $repoLeaf -replace '[/ .:]', '-' } else { $repoLeaf = $repoLeaf -replace '[/:]', '-' }
-    $folders  = Get-ChildItem -Path $ClaudeLogRoot -Directory -ErrorAction SilentlyContinue
+    # Fallback for a repo whose path changed since the logs were written: a
+    # folder whose name ENDS with the encoded repo leaf (FIX-W4 encodes the
+    # leaf; "my.repo" appears as "my-repo"). Matching the end, not any
+    # substring, stops "RetroRPG" picking up "...-RetroRPG-Scoping" or
+    # "reqwf-orchestrator" picking up "...-reqwf-orchestrator-control".
+    $repoLeaf = (Split-Path $repoRoot -Leaf) -replace '[^A-Za-z0-9]', '-'
+    $folders  = Get-ChildItem -LiteralPath $Root -Directory -ErrorAction SilentlyContinue | Sort-Object Name
     foreach ($f in $folders) {
-        if ($f.Name -like "*$repoLeaf*") { return $f.FullName }
+        if ($f.Name -eq $repoLeaf -or $f.Name.EndsWith("-$repoLeaf", [System.StringComparison]::OrdinalIgnoreCase)) { return $f.FullName }
     }
     return $null
 }
@@ -291,7 +342,18 @@ function Get-InCodeDocsFlag {
 # ── Read JSONL logs ───────────────────────────────────────────────────────────
 
 $lastCommit  = Get-LastCommitTime
-$logFolder   = Get-ProjectLogFolder
+$repoRoot    = git rev-parse --show-toplevel 2>$null
+
+# A repo may have logs under more than one Claude config dir (one per account):
+# scan every match into the same counters, each folder once.
+$logFolders  = [System.Collections.Generic.List[string]]::new()
+$seenFolders = @{}
+foreach ($root in (Get-ClaudeLogRoots)) {
+    $folder = Get-ProjectLogFolder -RepoRoot $repoRoot -Root $root
+    if (-not $folder) { continue }
+    $key = Resolve-RealPath $folder
+    if (-not $seenFolders.ContainsKey($key)) { $seenFolders[$key] = $true; $logFolders.Add($folder) }
+}
 
 $sessionCount      = 0
 $totalInteractions = 0
@@ -301,7 +363,7 @@ $sessionSummaries  = [System.Collections.Generic.List[string]]::new()
 
 foreach ($cat in $Categories.Keys) { $counts[$cat] = 0 }
 
-if ($logFolder -and (Test-Path $logFolder)) {
+foreach ($logFolder in $logFolders) {
 
     $jsonlFiles = Get-ChildItem -Path $logFolder -Filter "*.jsonl" -Recurse -ErrorAction SilentlyContinue |
                   Where-Object { $_.LastWriteTimeUtc -gt $lastCommit } |
@@ -373,6 +435,12 @@ if ($totalInteractions -gt 0) { $toolsUsed.Add("claude") }
 # sets these env vars in the (sub)agent's shell; their presence here is proof.
 $inClaudeSession = (($env:CLAUDECODE -eq '1') -or ($env:AI_AGENT -like 'claude-code*') -or [bool]$env:CLAUDE_CODE_ENTRYPOINT)
 if ($inClaudeSession -and -not $toolsUsed.Contains("claude")) { $toolsUsed.Add("claude") }
+if ($inClaudeSession -and $logFolders.Count -eq 0) {
+    # Make a missed log folder visible instead of silently writing zero counts.
+    # Never blocks: tracking stays best-effort.
+    $checked = (Get-ClaudeLogCandidates) -join ", "
+    [Console]::Error.WriteLine("ai-usage hook: warning: Claude session detected but no Claude Code log folder for this repo was found; AI-Sessions/AI-Interactions will be 0. Checked: $checked")
+}
 
 # ── FR-13: prompt behaviour is a per-clone setting, not hard-coded ────────────
 #   git config ai-tracking.selfdeclare <always|detected|off>

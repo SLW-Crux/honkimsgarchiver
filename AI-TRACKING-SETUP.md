@@ -52,7 +52,7 @@ each tool that fired. Full formats, mappings and how to add a detector:
 
 | `AI-Tool`  | Detected from                                              | Counts        | Runtime      | Confidence |
 |------------|------------------------------------------------------------|---------------|--------------|------------|
-| `claude`   | Claude Code JSONL logs, `~/.claude/projects/<repo>/`       | Full          | .py and .ps1 | High (verified) |
+| `claude`   | Claude Code JSONL logs, `<config dir>/projects/<repo>/` — `$CLAUDE_CONFIG_DIR`, `~/.claude` and every `~/.claude-*` | Full          | .py and .ps1 | High (verified) |
 | `codex`    | Codex CLI logs, `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, scoped by session `cwd` | Full | .py only | High (verified against real logs) |
 | `copilot`  | Copilot CLI logs, `~/.copilot/session-state/<id>/events.jsonl`, scoped by `cwd` | Full | .py only | Built from documented format — unverified against real logs |
 | `aider`    | `.aider.chat.history.md` in the repo, modified since HEAD  | Presence only | both         | Medium |
@@ -63,6 +63,14 @@ Env hints also attribute a tool when the commit is made from inside its
 shell even if no log matched: `CLAUDECODE` / `CLAUDE_CODE_ENTRYPOINT`
 (claude), `CODEX_SANDBOX` / `CODEX_THREAD_ID` / `CODEX_CI` (codex),
 `COPILOT_CLI` / `GITHUB_COPILOT_CLI` (copilot).
+
+Claude Code writes its logs under `$CLAUDE_CONFIG_DIR/projects` when that
+variable is set (one config dir per account, e.g. `~/.claude-devs`) and
+`~/.claude/projects` otherwise. The hook checks `$CLAUDE_CONFIG_DIR`,
+`~/.claude` and every `~/.claude-*`, and sums every match, so commits made
+from a plain terminal still count sessions from any account. If a Claude
+session is detected but no log folder is found anywhere, the hook prints a
+warning naming the folders it checked; the commit still goes through.
 
 **Cloud agents (Copilot coding agent, Codex cloud)** never run this hook —
 their commits are made on the provider's infrastructure, so they carry no

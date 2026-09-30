@@ -6,7 +6,10 @@
 # commit-message file and asserts the exact trailer block. Also asserts the
 # Merge-skip rule and the anchored idempotency check (FIX-W2), then the
 # Codex CLI and Copilot CLI detectors (separate fake HOMEs) and a combined
-# Claude+Codex HOME whose counts must sum into the same trailers.
+# Claude+Codex HOME whose counts must sum into the same trailers. Finally the
+# Claude config-dir lookup ($CLAUDE_CONFIG_DIR, ~/.claude, ~/.claude-*) for
+# both the Python hook and the PowerShell twin (the latter only when pwsh is
+# installed).
 #
 #   bash scripts/test-ai-usage-hook.sh
 #
@@ -15,6 +18,7 @@ set -u
 
 TEMPLATE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HOOK="$TEMPLATE_ROOT/.githooks/commit-msg"
+PS1="$TEMPLATE_ROOT/.githooks/append-ai-usage.ps1"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -37,7 +41,8 @@ REPO_ROOT="$(git -C "$REPO" rev-parse --show-toplevel)"
 
 # ── 2. Fake HOME with Claude Code session log for this repo ────────────────
 FAKE_HOME="$WORK/home"
-ENCODED="$(printf '%s' "$REPO_ROOT" | sed 's/[\/ .:]/-/g')"
+# Claude Code's rule: every non-alphanumeric character of the path → "-".
+ENCODED="$(printf '%s' "$REPO_ROOT" | sed 's/[^A-Za-z0-9]/-/g')"
 LOGDIR="$FAKE_HOME/.claude/projects/$ENCODED"
 mkdir -p "$LOGDIR"
 cat > "$LOGDIR/session-1.jsonl" <<'JSONL'
@@ -62,10 +67,15 @@ git -C "$REPO" add x.py test_x.py
 # also suppresses the interactive prompts, as in real agent-driven commits).
 run_hook_home() {
   local home="$1" msg="$2"; shift 2
+  # RUNTIME=ps1 runs the PowerShell twin directly; default is the real
+  # commit-msg entry point (which prefers python3).
+  local runner=("$HOOK" "$msg")
+  [ "${RUNTIME:-py}" = "ps1" ] && runner=(pwsh -NoProfile -File "$PS1" -CommitMsgFile "$msg")
   ( cd "$REPO" && env HOME="$home" CLAUDECODE= AI_AGENT= CLAUDE_CODE_ENTRYPOINT= \
+      CLAUDE_CONFIG_DIR= \
       CODEX_HOME= COPILOT_HOME= XDG_CONFIG_HOME= \
       CODEX_SANDBOX= CODEX_THREAD_ID= CODEX_CI= COPILOT_CLI= GITHUB_COPILOT_CLI= \
-      "$@" "$HOOK" "$msg" </dev/null 2>"$WORK/stderr" )
+      "$@" "${runner[@]}" </dev/null 2>"$WORK/stderr" )
 }
 run_hook() {  # $1 = message file  (original Claude-session harness)
   run_hook_home "$FAKE_HOME" "$1" CLAUDECODE=1
@@ -254,6 +264,111 @@ run_hook_home "$EMPTY_HOME" "$MSG6" CODEX_THREAD_ID=abc || fail "env-hint hook e
 grep -q '^AI-Tool: codex$' "$MSG6" && grep -q '^AI-Interactions: 0$' "$MSG6" \
   && pass "env hint: CODEX_THREAD_ID alone → AI-Tool: codex, zero counts" \
   || { cat "$MSG6"; fail "env hint: codex not attributed from CODEX_THREAD_ID"; }
+
+# ── 12. Claude config dirs: $CLAUDE_CONFIG_DIR, ~/.claude, ~/.claude-* ─────
+# One fixture session = 1 session, 3 interactions. All timestamps are after
+# the 2020 seed commit so both runtimes count the same.
+write_claude_session() {  # $1 = log folder, $2 = file name
+  mkdir -p "$1"
+  cat > "$1/$2" <<'JSONL'
+{"type":"user","timestamp":"2020-01-01T00:05:00Z","message":{"role":"user","content":"go"}}
+{"type":"assistant","timestamp":"2020-01-01T00:06:00Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"x.py"}},{"type":"tool_use","name":"Read","input":{"file_path":"x.py"}},{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}
+JSONL
+}
+
+# assert_counts <label> <home> <sessions> <interactions> [VAR=value ...]
+assert_counts() {
+  local label="$1" home="$2" sessions="$3" interactions="$4"; shift 4
+  local msg="$WORK/msg-$RUNTIME-$(printf '%s' "$label" | tr -c 'a-z0-9' '-')"
+  printf 'feat: add x\n' > "$msg"
+  run_hook_home "$home" "$msg" "$@" || fail "$RUNTIME $label: hook exited non-zero: $(cat "$WORK/stderr")"
+  if grep -qx "AI-Sessions: $sessions" "$msg" && grep -qx "AI-Interactions: $interactions" "$msg"; then
+    pass "$RUNTIME $label"
+  else
+    cat "$msg"; fail "$RUNTIME $label: expected AI-Sessions: $sessions, AI-Interactions: $interactions"
+  fi
+}
+
+CFG="$WORK/cfg"; mkdir -p "$CFG"
+# (a) logs only under a custom CLAUDE_CONFIG_DIR outside HOME
+H_CUSTOM="$CFG/home-custom"; mkdir -p "$H_CUSTOM"
+write_claude_session "$CFG/custom-config/projects/$ENCODED" a.jsonl
+# (b) logs only under ~/.claude-other; variable unset
+H_OTHER="$CFG/home-other"
+write_claude_session "$H_OTHER/.claude-other/projects/$ENCODED" b.jsonl
+# (c) logs under ~/.claude AND ~/.claude-other → counts add up
+H_TWO="$CFG/home-two"
+write_claude_session "$H_TWO/.claude/projects/$ENCODED" c1.jsonl
+write_claude_session "$H_TWO/.claude-other/projects/$ENCODED" c2.jsonl
+# (d) fuzzy fallback inside a non-default dir (folder name only contains the leaf)
+H_FUZZY="$CFG/home-fuzzy"
+write_claude_session "$H_FUZZY/.claude-other/projects/-moved-from-elsewhere-$(basename "$REPO_ROOT")" d.jsonl
+# (e) ~/.claude-link is a symlink to ~/.claude-real → scanned once
+H_LINK="$CFG/home-link"
+write_claude_session "$H_LINK/.claude-real/projects/$ENCODED" e.jsonl
+ln -s "$H_LINK/.claude-real" "$H_LINK/.claude-link"
+# (g) a lookalike folder for ANOTHER repo whose name merely contains this
+# repo's leaf ("...-repo-control") must not be picked up by the fuzzy fallback
+H_LOOK="$CFG/home-lookalike"
+write_claude_session "$H_LOOK/.claude/projects/-somewhere-else-$(basename "$REPO_ROOT")-control" g.jsonl
+# (h) a repo whose path contains underscores: Claude Code writes its logs to
+# ".../Under-Score/my-repo" (every non-alphanumeric → "-"); no fuzzy help,
+# because the leaf "my_repo" must be encoded the same way to match.
+UREPO="$WORK/Under_Score/my_repo"
+mkdir -p "$UREPO"; git -C "$UREPO" init -q
+git -C "$UREPO" -c user.email=t@e -c user.name=t -c commit.gpgsign=false \
+  commit -q --allow-empty -m initial --date=2020-01-01T00:00:00Z >/dev/null 2>&1
+GIT_COMMITTER_DATE="2020-01-01T00:00:00Z" git -C "$UREPO" -c user.email=t@e -c user.name=t \
+  -c commit.gpgsign=false commit -q --amend --allow-empty -m initial --date=2020-01-01T00:00:00Z >/dev/null 2>&1
+UROOT="$(git -C "$UREPO" rev-parse --show-toplevel)"
+H_UNDER="$CFG/home-underscore"
+write_claude_session "$H_UNDER/.claude/projects/$(printf '%s' "$UROOT" | sed 's/[^A-Za-z0-9]/-/g')" h.jsonl
+# (f) no logs anywhere
+H_NONE="$CFG/home-none"; mkdir -p "$H_NONE/.claude/projects" "$H_NONE/.claude-other"
+
+RUNTIMES="py"
+if command -v pwsh >/dev/null 2>&1; then RUNTIMES="py ps1"
+else echo "note: pwsh not found — PowerShell config-dir cases skipped"; fi
+
+WARN='^ai-usage hook: warning: Claude session detected but no Claude Code log folder'
+for RUNTIME in $RUNTIMES; do
+  assert_counts "config dir: custom CLAUDE_CONFIG_DIR only" "$H_CUSTOM" 1 3 \
+    CLAUDECODE=1 CLAUDE_CONFIG_DIR="$CFG/custom-config"
+  assert_counts "config dir: ~/.claude-other only, variable unset" "$H_OTHER" 1 3 CLAUDECODE=1
+  assert_counts "config dir: two dirs, counts add up" "$H_TWO" 2 6 CLAUDECODE=1
+  assert_counts "config dir: CLAUDE_CONFIG_DIR also matched by ~/.claude-* → no double count" \
+    "$H_TWO" 2 6 CLAUDECODE=1 CLAUDE_CONFIG_DIR="$H_TWO/.claude-other"
+  assert_counts "config dir: fuzzy fallback in ~/.claude-other" "$H_FUZZY" 1 3 CLAUDECODE=1
+  assert_counts "config dir: symlinked ~/.claude-link counted once" "$H_LINK" 1 3 CLAUDECODE=1
+  assert_counts "config dir: CLAUDE_CONFIG_DIR is a symlink to a scanned dir → counted once" \
+    "$H_LINK" 1 3 CLAUDECODE=1 CLAUDE_CONFIG_DIR="$H_LINK/.claude-link"
+
+  assert_counts "encoding: lookalike '<repo>-control' folder not counted" "$H_LOOK" 0 0 CLAUDECODE=1
+  SAVED_REPO="$REPO"; REPO="$UREPO"
+  assert_counts "encoding: underscores in the repo path (Xx_Github → Xx-Github)" "$H_UNDER" 1 3 CLAUDECODE=1
+  REPO="$SAVED_REPO"
+
+  # (f) Claude session, no logs anywhere → one warning naming the folders
+  # checked, trailers still written, commit not blocked.
+  assert_counts "no logs + Claude session: commit allowed, zero counts" "$H_NONE" 0 0 \
+    CLAUDECODE=1 CLAUDE_CONFIG_DIR="$CFG/missing-config"
+  if [ "$(grep -c "$WARN" "$WORK/stderr")" = "1" ] \
+     && grep -q "$CFG/missing-config/projects" "$WORK/stderr" \
+     && grep -q "$H_NONE/.claude/projects" "$WORK/stderr" \
+     && grep -q "$H_NONE/.claude-other/projects" "$WORK/stderr"; then
+    pass "$RUNTIME no logs + Claude session: one warning naming every folder checked"
+  else
+    cat "$WORK/stderr"; fail "$RUNTIME no logs + Claude session: warning missing or incomplete"
+  fi
+  # ...and no warning when logs were found, or when it isn't a Claude session.
+  assert_counts "logs found: no warning" "$H_OTHER" 1 3 CLAUDECODE=1
+  grep -q "$WARN" "$WORK/stderr" && { cat "$WORK/stderr"; fail "$RUNTIME warning printed although logs were found"; }
+  MSGN="$WORK/msg-$RUNTIME-nosession"; printf 'feat: add x\n' > "$MSGN"
+  run_hook_home "$H_NONE" "$MSGN" GIT_CONFIG_PARAMETERS="'ai-tracking.selfdeclare=off'" \
+    || fail "$RUNTIME no-session hook exited non-zero"
+  grep -q "$WARN" "$WORK/stderr" && { cat "$WORK/stderr"; fail "$RUNTIME warning printed outside a Claude session"; }
+  pass "$RUNTIME no warning when logs are found or no Claude session is detected"
+done
 
 echo
 printf '\033[32mALL HOOK TESTS PASSED\033[0m\n'
