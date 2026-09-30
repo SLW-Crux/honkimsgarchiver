@@ -9,7 +9,15 @@
 # restores the chain: if the framework is on PATH, run it against the staged
 # changes exactly as its own hook would; otherwise warn and allow the commit
 # (the hook chain is best-effort — CI remains the real enforcement).
+#
+# A repo with no .pre-commit-config.yaml has no local gate to chain to:
+# `pre-commit run` would fail every commit there, so skip with a notice.
 # ============================================================================
+
+if [ ! -f "$(git rev-parse --show-toplevel)/.pre-commit-config.yaml" ]; then
+  echo "pre-commit: no .pre-commit-config.yaml in this repo — local secret gate not configured, skipped (CI secret-scan still runs)."
+  exit 0
+fi
 
 if command -v pre-commit >/dev/null 2>&1; then
   exec pre-commit run --hook-stage pre-commit
