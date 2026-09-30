@@ -11,7 +11,8 @@
 #
 # Detectors (all feed the SAME AI-Sessions / AI-Interactions / AI-<category> /
 # Tests-Executed counters; AI-Tool lists every tool that fired):
-#   claude    ~/.claude/projects/<encoded repo>/*.jsonl      (full counts)
+#   claude    <config dir>/projects/<encoded repo>/*.jsonl   (full counts;
+#             config dirs: $CLAUDE_CONFIG_DIR, ~/.claude, ~/.claude-*)
 #   codex     ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl   (full counts)
 #   copilot   ~/.copilot/session-state/<id>/events.jsonl     (full counts,
 #             built from the documented layout — unverified against real logs)
@@ -138,8 +139,40 @@ def home_dir():
     return os.environ.get("HOME") or ""
 
 
-def claude_log_root():
-    return Path(home_dir()) / ".claude" / "projects"
+def claude_log_candidates():
+    """Every place Claude Code may keep its projects folder, in lookup order:
+    $CLAUDE_CONFIG_DIR when set (e.g. an alias that points Claude Code at
+    ~/.claude-devs), the default ~/.claude, and any other ~/.claude-* config
+    dir. Checking all of them means a commit from a plain terminal still finds
+    logs written under a custom config dir. Existence is not checked here."""
+    home = Path(home_dir())
+    candidates = []
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if cfg:
+        candidates.append(Path(cfg).expanduser() / "projects")
+    candidates.append(home / ".claude" / "projects")
+    try:
+        candidates += sorted(p / "projects" for p in home.glob(".claude-*"))
+    except OSError:
+        pass
+    return candidates
+
+
+def claude_log_roots():
+    """The candidates that exist, de-duplicated by resolved path so a symlinked
+    config dir is not scanned (and counted) twice."""
+    seen, roots = set(), []
+    for root in claude_log_candidates():
+        try:
+            if not root.is_dir():
+                continue
+            key = str(root.resolve())
+        except OSError:
+            continue
+        if key not in seen:
+            seen.add(key)
+            roots.append(root)
+    return roots
 
 
 def get_last_commit_time():
@@ -161,9 +194,18 @@ def is_newer(path, last_commit):
 
 
 def encode_project_path(repo_root):
-    # Claude Code encodes the project's absolute path into the log folder name:
-    #   Windows: C:\Users\me\repo     -> C--Users-me-repo
-    #   macOS  : /Users/me/My Project -> -Users-me-My-Project
+    # Claude Code names the log folder after the project's absolute path with
+    # EVERY character that is not a letter or digit replaced by "-":
+    #   Windows: C:\Users\me\repo      -> C--Users-me-repo
+    #   macOS  : /Users/me/My_Project -> -Users-me-My-Project
+    # (An underscore becomes "-" too, so ~/Xx_Github/repo is -...-Xx-Github-repo.)
+    return re.sub(r"[^A-Za-z0-9]", "-", repo_root)
+
+
+def legacy_encode_project_path(repo_root):
+    # The narrower rule this hook used before (only / . : and space on macOS,
+    # / and : on Windows). Kept as a second exact candidate so a log folder
+    # that genuinely has that shape is still found.
     if IS_WINDOWS:
         s = repo_root.replace("\\", "/")
         s = re.sub(r"^/", "", s)
@@ -171,18 +213,19 @@ def encode_project_path(repo_root):
     return re.sub(r"[/ .:]", "-", repo_root)
 
 
-def get_project_log_folder(repo_root):
+def get_project_log_folder(repo_root, root):
     if not repo_root:
         return None
-    root = claude_log_root()
-    encoded = encode_project_path(repo_root)
-    candidate = root / encoded
-    if candidate.exists():
-        return candidate
+    for encoded in (encode_project_path(repo_root), legacy_encode_project_path(repo_root)):
+        candidate = root / encoded
+        if candidate.is_dir():
+            return candidate
 
-    # FIX-W4: the fallback fuzzy match uses the ENCODED repo leaf (a leaf such
-    # as "my.repo" appears as "my-repo" in the folder name, so matching on the
-    # raw leaf could never hit).
+    # Fallback for a repo whose path changed since the logs were written: a
+    # folder whose name ENDS with the encoded repo leaf (FIX-W4 encodes the
+    # leaf; "my.repo" appears as "my-repo"). Matching the end, not any
+    # substring, stops "RetroRPG" picking up "...-RetroRPG-Scoping" or
+    # "reqwf-orchestrator" picking up "...-reqwf-orchestrator-control".
     leaf = os.path.basename(repo_root.rstrip("/\\")) or repo_root
     leaf_enc = encode_project_path(leaf).lower()
     try:
@@ -191,7 +234,8 @@ def get_project_log_folder(repo_root):
         return None
     for name in names:
         p = root / name
-        if p.is_dir() and leaf_enc in name.lower():
+        low = name.lower()
+        if p.is_dir() and (low == leaf_enc or low.endswith("-" + leaf_enc)):
             return p
     return None
 
@@ -367,7 +411,7 @@ def entry_in_window(entry, last_commit):
 # ── Log scanners (one per tool, all feed the shared tally) ────────────────────
 
 def scan_claude(log_folder, last_commit, tally):
-    """Claude Code: ~/.claude/projects/<encoded repo>/**/*.jsonl.
+    """Claude Code: <config dir>/projects/<encoded repo>/**/*.jsonl.
     Returns True when at least one tool call was counted."""
     if not (log_folder and log_folder.exists()):
         return False
@@ -700,12 +744,29 @@ def main(argv):
 
     last_commit = get_last_commit_time()
     repo_root = git("rev-parse", "--show-toplevel").strip()
-    log_folder = get_project_log_folder(repo_root)
 
     # ── Scan every detector's logs into one shared tally ──────────────────
     tally = new_tally()
     tools_used = []
-    if scan_claude(log_folder, last_commit, tally):
+    # A repo may have logs under more than one Claude config dir (one per
+    # account): scan every match into the same tally, each folder once.
+    claude_folders, seen_folders = [], set()
+    for root in claude_log_roots():
+        folder = get_project_log_folder(repo_root, root)
+        if not folder:
+            continue
+        try:
+            key = str(folder.resolve())
+        except OSError:
+            key = str(folder)
+        if key not in seen_folders:
+            seen_folders.add(key)
+            claude_folders.append(folder)
+    found_claude = False
+    for folder in claude_folders:
+        if scan_claude(folder, last_commit, tally):
+            found_claude = True
+    if found_claude:
         tools_used.append("claude")
     if scan_codex(repo_root, last_commit, tally):
         tools_used.append("codex")
@@ -747,6 +808,16 @@ def main(argv):
     )
     if in_claude_session and "claude" not in tools_used:
         tools_used.append("claude")
+    if in_claude_session and not claude_folders:
+        # Make a missed log folder visible instead of silently writing zero
+        # counts. Never blocks: tracking stays best-effort.
+        checked = ", ".join(str(p) for p in claude_log_candidates())
+        print(
+            "ai-usage hook: warning: Claude session detected but no Claude Code "
+            "log folder for this repo was found; AI-Sessions/AI-Interactions "
+            "will be 0. Checked: " + checked,
+            file=sys.stderr,
+        )
 
     # Same idea for the other terminal agents: a commit made from inside their
     # sandbox/shell is attributed even when no log was found. (Codex var names
